@@ -115,8 +115,10 @@ def build_silu_and_mul_fq_module(
         c4_i32 = arith.constant(4, type=i32)
         c5_i32 = arith.constant(5, type=i32)
         c7_i32 = arith.constant(7, type=i32)
+        c8_i32 = arith.constant(8, type=i32)
         c15_i32 = arith.constant(15, type=i32)
         c21_i32 = arith.constant(21, type=i32)
+        c22_i32 = arith.constant(22, type=i32)
         c23_i32 = arith.constant(23, type=i32)
         c28_i32 = arith.constant(28, type=i32)
         c31_i32 = arith.constant(31, type=i32)
@@ -131,9 +133,15 @@ def build_silu_and_mul_fq_module(
         c0xFF800000_i32 = arith.constant(0xFF800000, type=i32)
         c0x400000_i32 = arith.constant(0x400000, type=i32)
         c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=i32)
+        c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=i32)
         c0x80000000_i32 = arith.constant(0x80000000, type=i32)
+        c_denorm_i32 = arith.constant(149 << 23, type=i32)
+        c_normal_round_bias_i32 = arith.constant(
+            ((1 - 127) << 23) + (1 << 21) - 1, type=i32
+        )
         c0_f32 = arith.constant(0.0, type=f32)
         c1_f32 = arith.constant(1.0, type=f32)
+        c6_f32 = arith.constant(6.0, type=f32)
         c_headroom_i32 = arith.constant(_fp_headroom, type=i32)
 
         scale_cols_i32 = arith.constant(scale_cols, type=i32)
@@ -173,18 +181,28 @@ def build_silu_and_mul_fq_module(
 
             def _f32_to_e2m1(qx_f32):
                 qx = qx_f32.bitcast(i32)
-                s = qx & c0x80000000_i32
-                e = (qx >> c23_i32) & c0xFF_i32
-                m = qx & c0x7FFFFF_i32
-                adj_exp = arith.maxsi(c126_i32 - e, c0_i32)
-                m_denorm = (c0x400000_i32 | (m >> c1_i32)) >> adj_exp
-                is_denorm = arith.cmpi(CmpIPredicate.ult, e, c127_i32)
-                m = arith.select(is_denorm, m_denorm, m)
-                e = arith.maxsi(e - c126_i32, c0_i32)
-                combined = (e << c2_i32) | (m >> c21_i32)
-                rounded = (combined + c1_i32) >> c1_i32
-                e2m1 = arith.minui(rounded, c7_i32)
-                return (s >> c28_i32) | e2m1
+                sign = qx & c0x80000000_i32
+                abs_i = qx & c0x7FFFFFFF_i32
+                abs_f = abs_i.bitcast(f32)
+
+                normal_mask = arith.andi(
+                    arith.cmpf(arith.CmpFPredicate.OGE, abs_f, c1_f32),
+                    arith.cmpf(arith.CmpFPredicate.OLT, abs_f, c6_f32),
+                )
+                denormal_mask = arith.cmpf(arith.CmpFPredicate.OLT, abs_f, c1_f32)
+
+                denorm_f = c_denorm_i32.bitcast(f32)
+                denorm_val = (abs_f + denorm_f).bitcast(i32) - c_denorm_i32
+
+                mant_odd = (abs_i >> c22_i32) & c1_i32
+                normal_val = abs_i + c_normal_round_bias_i32
+                normal_val = normal_val + mant_odd
+                normal_val = normal_val >> c22_i32
+
+                e2m1 = arith.select(normal_mask, normal_val, c7_i32)
+                e2m1 = arith.select(denormal_mask, denorm_val, e2m1)
+                sign_lp = (sign >> c28_i32) & c8_i32
+                return sign_lp | e2m1
 
         thread_id = ArithValue(tid)
         COLS_PER_ITER = BLOCK_THREADS * VEC
@@ -314,9 +332,12 @@ def build_silu_and_mul_fq_module(
                             f32, "llvm.amdgcn.rcp.f32", [den], [], []
                         )
                         if const_expr(act == "swiglu"):
-                            act_vals.append(gate * sig * (linear + c1_f32))
+                            act_v = gate * sig * (linear + c1_f32)
                         else:
-                            act_vals.append(gate * sig * linear)
+                            act_v = gate * sig * linear
+                        if const_expr(_need_quant):
+                            act_v = arith.extf(f32, arith.trunc_f(T.bf16, act_v))
+                        act_vals.append(act_v)
 
                     if const_expr(_need_quant):
                         local_max = c0_f32

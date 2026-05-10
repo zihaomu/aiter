@@ -2199,6 +2199,7 @@ def compile_mixed_moe_gemm1(
                 _c7_i32 = arith.constant(7, type=T.i32)
                 _c15_i32 = arith.constant(15, type=T.i32)
                 _c21_i32 = arith.constant(21, type=T.i32)
+                _c22_i32 = arith.constant(22, type=T.i32)
                 _c23_i32 = arith.constant(23, type=T.i32)
                 _c28_i32 = arith.constant(28, type=T.i32)
                 _c31_i32 = arith.constant(31, type=T.i32)
@@ -2213,28 +2214,47 @@ def compile_mixed_moe_gemm1(
                 _c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)
                 _c0x400000_i32 = arith.constant(0x400000, type=T.i32)
                 _c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=T.i32)
+                _c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
                 _c0x80000000_i32 = arith.constant(0x80000000, type=T.i32)
+                _c_denorm_i32 = arith.constant(149 << 23, type=T.i32)
+                _c_normal_round_bias_i32 = arith.constant(
+                    ((1 - 127) << 23) + (1 << 21) - 1, type=T.i32
+                )
                 _c0_f32 = arith.constant(0.0, type=T.f32)
+                _c1_f32 = arith.constant(1.0, type=T.f32)
+                _c6_f32 = arith.constant(6.0, type=T.f32)
 
                 _c8_i32 = arith.constant(8, type=T.i32)
                 _fp_headroom = 2 if _need_fp4 else (8 if _need_fp8 else 0)
                 _c_headroom_i32 = arith.constant(_fp_headroom, type=T.i32)
 
                 def _f32_to_e2m1(qx_f32):
-                    """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
+                    """Match torch reference MXFP4 e2m1 round-to-nearest-even."""
                     qx = qx_f32.bitcast(T.i32)
-                    s = qx & _c0x80000000_i32
-                    e = (qx >> _c23_i32) & _c0xFF_i32
-                    m = qx & _c0x7FFFFF_i32
-                    adj_exp = arith.maxsi(_c126_i32 - e, _c0_i32)
-                    m_denorm = (_c0x400000_i32 | (m >> _c1_i32)) >> adj_exp
-                    is_denorm = arith.cmpi(CmpIPredicate.ult, e, _c127_i32)
-                    m = arith.select(is_denorm, m_denorm, m)
-                    e = arith.maxsi(e - _c126_i32, _c0_i32)
-                    combined = (e << _c2_i32) | (m >> _c21_i32)
-                    rounded = (combined + _c1_i32) >> _c1_i32
-                    e2m1 = arith.minui(rounded, _c7_i32)
-                    return (s >> _c28_i32) | e2m1
+                    sign = qx & _c0x80000000_i32
+                    abs_i = qx & _c0x7FFFFFFF_i32
+                    abs_f = abs_i.bitcast(T.f32)
+
+                    normal_mask = arith.andi(
+                        arith.cmpf(arith.CmpFPredicate.OGE, abs_f, _c1_f32),
+                        arith.cmpf(arith.CmpFPredicate.OLT, abs_f, _c6_f32),
+                    )
+                    denormal_mask = arith.cmpf(
+                        arith.CmpFPredicate.OLT, abs_f, _c1_f32
+                    )
+
+                    denorm_f = _c_denorm_i32.bitcast(T.f32)
+                    denorm_val = (abs_f + denorm_f).bitcast(T.i32) - _c_denorm_i32
+
+                    mant_odd = (abs_i >> _c22_i32) & _c1_i32
+                    normal_val = abs_i + _c_normal_round_bias_i32
+                    normal_val = normal_val + mant_odd
+                    normal_val = normal_val >> _c22_i32
+
+                    e2m1 = arith.select(normal_mask, normal_val, _c7_i32)
+                    e2m1 = arith.select(denormal_mask, denorm_val, e2m1)
+                    sign_lp = (sign >> _c28_i32) & _c8_i32
+                    return sign_lp | e2m1
 
                 if const_expr(_need_sort):
                     _n32_sort = _sorted_scale_cols_i32 * _c32_i32
@@ -2247,11 +2267,13 @@ def compile_mixed_moe_gemm1(
                     if const_expr(_need_quant and not _is_splitk):
                         frag_vals = []
                         for i in range_constexpr(_e_vec):
-                            frag_vals.append(
-                                vector.extract(
-                                    frag, static_position=[i], dynamic_position=[]
-                                )
+                            v_frag = vector.extract(
+                                frag, static_position=[i], dynamic_position=[]
                             )
+                            v_frag = arith.extf(
+                                T.f32, arith.trunc_f(T.bf16, v_frag)
+                            )
+                            frag_vals.append(v_frag)
 
                         local_max = _c0_f32
                         for i in range_constexpr(_e_vec):
